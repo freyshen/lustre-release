@@ -52,14 +52,11 @@ jobs:
           yum config-manager --enable PowerTools || :
           dnf config-manager --set-enabled powertools || :
           
-      - name: Install dependencies
-        run: ${{ matrix.install-dependency }}
-
       - name: prepare Build reaf
         run: |
-          pip3 install pyYAML fire filelock prettytable python-dateutil toml setuptools wcwidth wheel termcolor six
           dnf install -y gcc autoconf libtool which make patch diffutils file binutils-devel python38 python3-devel elfutils-devel libselinux-devel libaio-devel dnf-plugins-core bc bison flex git libyaml-devel libnl3-devel libmount-devel json-c-devel redhat-lsb libssh-devel libattr-devel libtirpc-devel libblkid-devel openssl-devel libuuid-devel texinfo texinfo-tex
-          # yum -y install audit-libs-devel binutils-devel elfutils-devel kabi-dw ncurses-devel newt-devel numactl-devel openssl-devel pciutils-devel perl perl-devel python2 python3-docutils xmlto xz-devel elfutils-libelf-devel libcap-devel libcap-ng-devel llvm-toolset libyaml libyaml-devel kernel-rpm-macros kernel-abi-whitelists opencsd-devel
+          yum -y install audit-libs-devel binutils-devel elfutils-devel kabi-dw ncurses-devel newt-devel numactl-devel openssl-devel pciutils-devel perl perl-devel python2 python3-docutils xmlto xz-devel elfutils-libelf-devel libcap-devel libcap-ng-devel llvm-toolset libyaml libyaml-devel kernel-rpm-macros kernel-abi-whitelists opencsd-devel
+          dnf install -y epel-release
           dnf install -y ccache pdsh
           dnf --enablerepo=ha install resource-agents
           dnf install -y bpftool dwarves java-devel libbabeltrace-devel libbpf-devel libmnl-devel net-tools rsync
@@ -85,6 +82,36 @@ jobs:
                patch_file="$HOME/lustre-release/lustre/kernel_patches/patches/${patch}"; \
                cat "${patch_file}" >> "$HOME/lustre-kernel-`uname -m`-lustre.patch"; \
           done
+          cp ~/lustre-kernel-`uname -m`-lustre.patch ~/kernel/rpmbuild/SOURCES/patch-4.18.0-lustre.patch
+          sed -i.inst -e '/^    find $RPM_BUILD_ROOT\/lib\/modules\/$KernelVer/a\
+              cp -a fs/ext4/* $RPM_BUILD_ROOT/lib/modules/$KernelVer/build/fs/ext4\
+              rm -f $RPM_BUILD_ROOT/lib/modules/$KernelVer/build/fs/ext4/ext4-inode-test*' \
+          -e '/^# empty final patch to facilitate testing of kernel patches/i\
+          Patch99995: patch-%{version}-lustre.patch' \
+          -e '/^ApplyOptionalPatch linux-kernel-test.patch/i\
+          ApplyOptionalPatch patch-%{version}-lustre.patch' \
+          ~/kernel/rpmbuild/SPECS/kernel.spec
+
+          echo '# x86_64' > ~/kernel/rpmbuild/SOURCES/kernel-`uname -m`.config
+          cat ~/lustre-release/lustre/kernel_patches/kernel_configs/kernel-4.18.0-4.18-rhel8.7-`uname -m`.config >> ~/kernel/rpmbuild/SOURCES/kernel-`uname -m`.config
+          
+          cd ~/kernel/rpmbuild && buildid="_lustre" && \
+          rpmbuild -ba --with firmware --target `uname -m` --with baseonly \
+                     --without kabichk --define "buildid ${buildid}" \
+                     ~/kernel/rpmbuild/SPECS/kernel.spec
+
+          cd ~/kernel/rpmbuild/RPMS/`uname -m`/
+          sudo rpm -Uvh --replacepkgs --force kernel-*.rpm
+          sudo reboot
+
+          cd lustre-release
+          ./configure --with-linux=/home/build/kernel/rpmbuild/BUILD/kernel-4.18.0-425.19.2.el8_7/linux-4.18.0-425.19.2.el8_lustre.`uname -m`/ --disable-gss --disable-crypto
+          
+          make -j8
+          sudo make install
+          sudo depmod -a
+
+          /usr/lib64/lustre/tests/llmount.sh
 
       - name: Upload artifacts
         uses: actions/upload-artifact@master
