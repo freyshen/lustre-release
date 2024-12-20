@@ -92,7 +92,7 @@ jobs:
         uses: actions/upload-artifact@master
         with:
           name: artifacts-${{ matrix.label }}
-          path: ./coral-*
+          path: ./*.rpm
       - name: Upload logs
         uses: actions/upload-artifact@master
         if: ${{ always() }}  # Upload logs regardless of whether the build failed or not
