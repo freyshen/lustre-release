@@ -1,23 +1,101 @@
-name: C/C++ CI
+name: c-cpp
 
 on:
-  push:
-    branches: [ "b2_15" ]
-  pull_request:
-    branches: [ "b2_15" ]
+  #push:
+  workflow_dispatch:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
-
+    strategy:
+      fail-fast: false
+      matrix:
+        label:
+          - el8
+        include:
+          - label: el8
+            container: centos:8
+            install-dependency: dnf install -y python3 rsync which
+    
+    container:
+      image: ${{ matrix.container }}
+    
     steps:
-    - uses: actions/checkout@v4
-    - name: configure
-      run: ./configure
-    - name: make
-      run: make
-    - name: make check
-      run: make check
-    - name: make distcheck
-      run: make distcheck
+      - uses: actions/checkout@v3
+
+      - name: Some hacks for CentOS 8 (EOL) to work again.
+        if: ${{ matrix.label == 'el8' }}
+        run: |
+          sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-Linux-*
+          sed -i 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-Linux-*
+          yum upgrade -y
+          yum clean all && yum makecache
+          yum distro-sync -y --allowerasing
+          
+      - name: Extra repos for CentOS8
+        if: ${{ matrix.label == 'el8' }}
+        run: |
+         echo '[ltb-project]'                                              >  /etc/yum.repos.d/ltb-project.repo
+         echo 'name=LTB project packages'                                  >> /etc/yum.repos.d/ltb-project.repo
+         echo 'baseurl=https://ltb-project.org/rpm/$releasever/$basearch'  >> /etc/yum.repos.d/ltb-project.repo
+         echo 'enabled=1'                                                  >> /etc/yum.repos.d/ltb-project.repo
+         echo 'gpgcheck=1'                                                 >> /etc/yum.repos.d/ltb-project.repo
+         echo 'gpgkey=https://www.ltb-project.org/documentation/_static/RPM-GPG-KEY-LTB-project' >> /etc/yum.repos.d/ltb-project.repo
+         rpm --import https://www.ltb-project.org/documentation/_static/RPM-GPG-KEY-LTB-project
+         yum install -y epel-release
+         yum -y groupinstall "Development Tools"
+
+      - name: Enable PowerTools on CentOS 8.
+        if: ${{ matrix.label == 'el8' }}
+        run: |
+          yum install -y yum-utils wget
+          yum config-manager --enable PowerTools || :
+          dnf config-manager --set-enabled powertools || :
+          
+      - name: Install dependencies
+        run: ${{ matrix.install-dependency }}
+
+      - name: prepare Build reaf
+        run: |
+          pip3 install pyYAML fire filelock prettytable python-dateutil toml setuptools wcwidth wheel termcolor six
+          dnf install -y gcc autoconf libtool which make patch diffutils file binutils-devel python38 python3-devel elfutils-devel libselinux-devel libaio-devel dnf-plugins-core bc bison flex git libyaml-devel libnl3-devel libmount-devel json-c-devel redhat-lsb libssh-devel libattr-devel libtirpc-devel libblkid-devel openssl-devel libuuid-devel texinfo texinfo-tex
+          yum -y install audit-libs-devel binutils-devel elfutils-devel kabi-dw ncurses-devel newt-devel numactl-devel openssl-devel pciutils-devel perl perl-devel python2 python3-docutils xmlto xz-devel elfutils-libelf-devel libcap-devel libcap-ng-devel llvm-toolset libyaml libyaml-devel kernel-rpm-macros kernel-abi-whitelists opencsd-devel
+          dnf install -y ccache pdsh
+          dnf --enablerepo=ha install resource-agents
+          dnf install -y bpftool dwarves java-devel libbabeltrace-devel libbpf-devel libmnl-devel net-tools rsync
+          # May only be needed on RHEL9 derivatives:
+          dnf install -y python3-devel
+          
+      - name: Coral Build
+        run: |  
+          git clone "https://review.whamcloud.com/tools/e2fsprogs" e2fsprogs && cd e2fsprogs && git checkout v1.47.1-wc1 && ./configure --with-root-prefix=/usr --enable-elf-shlibs --disable-uuidd --disable-fsck --disable-e2initrd-helper --disable-libblkid --disable-libuuid --enable-quota --disable-fuse2fs && make -j8
+          sudo make install
+          cd ..
+          
+          sh ./autogen.sh
+
+      - name: Prepare a patched kernel for Lustre
+        run: |  
+          cd $HOME && mkdir -p kernel/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          cd kernel && echo '%_topdir %(echo $HOME)/kernel/rpmbuild' > ~/.rpmmacros
+          rpm -ivh https://dl.rockylinux.org/vault/rocky/8.7/BaseOS/source/tree/Packages/k/kernel-4.18.0-425.19.2.el8_7.src.rpm
+          cd ~/kernel/rpmbuild && rpmbuild -bp --target=`uname -m` ./SPECS/kernel.spec
+          cp ~/kernel/rpmbuild/BUILD/kernel-4.18.0-425.19.2.el8_7/linux-4.18.0-425.19.2.el8.`uname -m`/configs/kernel-4.18.0-`uname -m`.config ~/lustre-release/lustre/kernel_patches/kernel_configs/kernel-4.18.0-4.18-rhel8.7-`uname -m`.config
+          sed -i '/# IO Schedulers/a CONFIG_IOSCHED_DEADLINE=y\nCONFIG_DEFAULT_IOSCHED="deadline"' ~/lustre-release/lustre/kernel_patches/kernel_configs/kernel-4.18.0-4.18-rhel8.7-`uname -m`.config
+          cd ~/lustre-release/lustre/kernel_patches/series && \
+          for patch in $(<"4.18-rhel8.7.series"); do \
+               patch_file="$HOME/lustre-release/lustre/kernel_patches/patches/${patch}"; \
+               cat "${patch_file}" >> "$HOME/lustre-kernel-`uname -m`-lustre.patch"; \
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@master
+        with:
+          name: artifacts-${{ matrix.label }}
+          path: ./coral-*
+      - name: Upload logs
+        uses: actions/upload-artifact@master
+        if: ${{ always() }}  # Upload logs regardless of whether the build failed or not
+        with:
+          name: logs-${{ matrix.label }}
+          path: ./coral_build_*/*.log
